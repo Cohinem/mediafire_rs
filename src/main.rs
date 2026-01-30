@@ -11,7 +11,7 @@ use crate::utils::{create_directory_if_not_exists, match_mediafire_valid_url};
 use anyhow::Result;
 use anyhow::anyhow;
 use clap::ArgAction;
-use clap::{arg, command, value_parser};
+use clap::{arg, command, value_parser, ArgGroup};
 use global::*;
 use std::fs::File;
 use std::io;
@@ -29,13 +29,18 @@ async fn main() -> Result<()> {
         .color(clap::ColorChoice::Always)
         .arg(
             arg!([URL] "Folder or file to download")
-                .required(true)
+                .required(false)
                 .value_parser(value_parser!(String)),
         )
         .arg(
             arg!(-o --output <OUTPUT> "Output directory")
                 .required(false)
                 .default_value(".")
+                .value_parser(value_parser!(PathBuf)),
+        )
+        .arg(
+            arg!(-l --links <FILE> "Read Mediafire links from a text file (one per line)")
+                .required(false)
                 .value_parser(value_parser!(PathBuf)),
         )
         .arg(
@@ -59,13 +64,45 @@ async fn main() -> Result<()> {
             arg!(--"proxy-download" "Downloads files through proxies, the default is to use proxies for the API only")
                 .action(ArgAction::SetTrue)
         )
+        .group(ArgGroup::new("input").args(["URL", "links"]).required(true))
         .get_matches();
     let matches = get_matches;
 
-    let url = matches.get_one::<String>("URL").unwrap();
     let path = matches.get_one::<PathBuf>("output").unwrap().to_path_buf();
     let max = *matches.get_one::<u32>("max").unwrap();
     let tries = *matches.get_one::<u32>("tries").unwrap();
+    let mut urls: Vec<String> = Vec::new();
+    if let Some(url) = matches.get_one::<String>("URL") {
+        for part in url.split(',') {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            urls.push(trimmed.to_string());
+        }
+    }
+    if let Some(links_path) = matches.get_one::<PathBuf>("links") {
+        let links_file = File::open(links_path).map_err(|e| {
+            anyhow!(
+                "Failed to open links file {}: {}",
+                links_path.display(),
+                e
+            )
+        })?;
+        for line in io::BufReader::new(links_file).lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            urls.push(trimmed.to_string());
+        }
+    }
+
+    if urls.is_empty() {
+        return Err(anyhow!("No links provided"));
+    }
+
     let proxies: Option<Vec<String>> = matches.get_one::<PathBuf>("proxy").map(|path| {
         let proxy_file = File::open(path).unwrap();
         io::BufReader::new(proxy_file)
@@ -76,36 +113,39 @@ async fn main() -> Result<()> {
     let proxy_downloads = *matches.get_one::<bool>("proxy-download").unwrap();
 
     let client = std::sync::Arc::new(Client::new(proxies, proxy_downloads));
-    let option = match_mediafire_valid_url(url);
 
     TOTAL_PROGRESS_BAR.enable_steady_tick(Duration::from_millis(120));
     TOTAL_PROGRESS_BAR.set_style(PROGRESS_STYLE_TOTAL_START.clone());
 
-    if option.is_none() {
-        return Err(anyhow!("Invalid Mediafire URL"));
-    }
-
-    let (mode, key) = option.unwrap();
-
-    match mode.as_str() {
-        "folder" => {
-            if let Some(folder) = folder::get_info(&client, &key).await?.folder_info {
-                download_folder(&client, &key, path.join(PathBuf::from(folder.name)), 1).await?;
-            } else {
-                return Err(anyhow!("Invalid Mediafire folder URL"));
-            }
+    for url in urls {
+        let option = match_mediafire_valid_url(&url);
+        if option.is_none() {
+            return Err(anyhow!("Invalid Mediafire URL: {}", url));
         }
-        "file" | "file_premium" | "download" => {
-            create_directory_if_not_exists(&path).await?;
-            let response = file::get_info(&key).await?;
-            if let Some(file_info) = response.file_info {
-                let path = path.join(PathBuf::from(&file_info.filename));
-                QUEUE.push(DownloadJob::new(file_info.into(), path));
-            } else {
-                return Err(anyhow!("Invalid Mediafire file URL"));
+
+        let (mode, key) = option.unwrap();
+
+        match mode.as_str() {
+            "folder" => {
+                if let Some(folder) = folder::get_info(&client, &key).await?.folder_info {
+                    download_folder(&client, &key, path.join(PathBuf::from(folder.name)), 1)
+                        .await?;
+                } else {
+                    return Err(anyhow!("Invalid Mediafire folder URL"));
+                }
             }
+            "file" | "file_premium" | "download" => {
+                create_directory_if_not_exists(&path).await?;
+                let response = file::get_info(&key).await?;
+                if let Some(file_info) = response.file_info {
+                    let path = path.join(PathBuf::from(&file_info.filename));
+                    QUEUE.push(DownloadJob::new(file_info.into(), path));
+                } else {
+                    return Err(anyhow!("Invalid Mediafire file URL"));
+                }
+            }
+            _ => return Err(anyhow!("Invalid Mediafire URL")),
         }
-        _ => return Err(anyhow!("Invalid Mediafire URL")),
     }
 
     if QUEUE.len() == 0 {
